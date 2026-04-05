@@ -3,10 +3,12 @@ GNSS RAG Ingestion Pipeline
 Run once: extracts text from PDFs, chunks it, embeds it, and stores in ChromaDB.
 
 Usage:
-    python ingest.py                     # uses default strategy from config
-    python ingest.py --strategy fixed    # fixed-size token windows
-    python ingest.py --strategy sentence # sentence-based grouping
-    python ingest.py --strategy semantic # semantic similarity breakpoints
+    python ingest.py                           # uses default strategy from config
+    python ingest.py --strategy fixed          # fixed-size token windows (512 tokens)
+    python ingest.py --strategy sentence       # sentence-based grouping
+    python ingest.py --strategy semantic       # semantic similarity breakpoints
+    python ingest.py --chunk-size 200          # fixed strategy at 200 tokens
+    python ingest.py --chunk-size 1000         # fixed strategy at 1000 tokens
 """
 
 import os
@@ -197,17 +199,21 @@ def chunk_pages_semantic(pages: list[dict], doc_name: str, doc_file: str,
     return chunks
 
 
-def run_ingestion(strategy: str = None):
+def run_ingestion(strategy: str = None, chunk_size_override: int = None):
     """Main ingestion pipeline.
 
     Args:
         strategy: Chunking strategy override. If None, uses config default.
+        chunk_size_override: Override chunk size for fixed strategy (for
+            Session 8 slide 27-28 comparison across 200/500/1000 tokens).
     """
     strategy = strategy or CHUNKING_STRATEGY
-    collection_name = get_collection_name(strategy)
+    cs = chunk_size_override or CHUNK_SIZE
+    collection_name = get_collection_name(strategy, chunk_size=chunk_size_override)
 
     print("=" * 60)
-    print(f"GNSS RAG Ingestion Pipeline  [strategy: {strategy}]")
+    size_info = f", chunk_size: {cs}" if strategy == "fixed" else ""
+    print(f"GNSS RAG Ingestion Pipeline  [strategy: {strategy}{size_info}]")
     print("=" * 60)
 
     # Initialize tokenizer
@@ -239,9 +245,10 @@ def run_ingestion(strategy: str = None):
 
         # --- Step 3: Chunk using selected strategy ---
         if strategy == "fixed":
+            overlap = max(1, cs // 8)  # ~12.5% overlap, scales with chunk size
             chunks = chunk_pages(
                 pages, doc_name, filename,
-                CHUNK_SIZE, CHUNK_OVERLAP, encoding
+                cs, overlap, encoding
             )
         elif strategy == "sentence":
             chunks = chunk_pages_sentence(
@@ -341,5 +348,11 @@ if __name__ == "__main__":
         default=None,
         help="Chunking strategy (default: uses config.py CHUNKING_STRATEGY)"
     )
+    parser.add_argument(
+        "--chunk-size", type=int, default=None,
+        help="Override chunk size for fixed strategy (e.g., 200, 512, 1000)"
+    )
     args = parser.parse_args()
-    run_ingestion(strategy=args.strategy)
+    if args.chunk_size and args.strategy and args.strategy != "fixed":
+        parser.error("--chunk-size only applies to the 'fixed' strategy")
+    run_ingestion(strategy=args.strategy, chunk_size_override=args.chunk_size)

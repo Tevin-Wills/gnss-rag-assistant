@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -19,9 +21,12 @@ from config import (
     SAMPLE_QUESTIONS, EMBEDDING_MODEL, LLM_MODEL,
     CHUNK_SIZE, CHUNK_OVERLAP, TOP_K, GROQ_API_KEY,
     CHUNKING_STRATEGY, SENTENCE_CHUNK_TARGET,
-    SEMANTIC_SIMILARITY_THRESHOLD,
+    SEMANTIC_SIMILARITY_THRESHOLD, CHUNK_SIZE_VARIANTS,
 )
-from rag_pipeline import query_pipeline, generate_without_rag, get_db_stats
+from rag_pipeline import (
+    query_pipeline, generate_without_rag, get_db_stats,
+    retrieve_with_strategy, get_all_strategy_stats, get_chunk_size_stats,
+)
 
 # ── Paths ──
 BASE_DIR = Path(__file__).parent
@@ -36,6 +41,30 @@ def _load_logo_b64(filename: str) -> str:
     if ext == "jpg":
         ext = "jpeg"
     return f"data:image/{ext};base64,{base64.b64encode(data).decode()}"
+
+
+# ── Plotly theme ──
+_PLOTLY_BG = "#0D1B2A"
+_PLOTLY_CARD = "#142A3E"
+_PLOTLY_CYAN = "#00BCD4"
+_PLOTLY_TEXT = "#E0E7EE"
+_PLOTLY_ACCENT2 = "#26C6DA"
+_PLOTLY_ACCENT3 = "#4DD0E1"
+_PLOTLY_PALETTE = ["#00BCD4", "#26C6DA", "#4DD0E1", "#80DEEA", "#B2EBF2"]
+
+
+def _plotly_layout(**overrides) -> go.Layout:
+    """Return a dark-themed Plotly layout matching the dashboard palette."""
+    defaults = dict(
+        paper_bgcolor=_PLOTLY_BG,
+        plot_bgcolor=_PLOTLY_CARD,
+        font=dict(color=_PLOTLY_TEXT, family="sans-serif"),
+        margin=dict(l=40, r=20, t=40, b=40),
+        xaxis=dict(gridcolor="#1E3A52", zerolinecolor="#1E3A52"),
+        yaxis=dict(gridcolor="#1E3A52", zerolinecolor="#1E3A52"),
+    )
+    defaults.update(overrides)
+    return go.Layout(**defaults)
 
 
 LOGO_BUAA = _load_logo_b64("university logo.png")
@@ -751,6 +780,7 @@ with st.sidebar:
     # Chunking strategy
     st.markdown("**Chunking Strategy**")
     st.markdown(f"Active: {_strategy_description()}")
+    st.markdown(f"Overlap: {CHUNK_OVERLAP} tokens ({CHUNK_OVERLAP/CHUNK_SIZE*100:.0f}%)")
     st.markdown("Tokenizer: cl100k_base")
 
     st.divider()
@@ -760,6 +790,16 @@ with st.sidebar:
     st.markdown(f"Embedding: `{EMBEDDING_MODEL}` (384d, local)")
     st.markdown(f"LLM: `{LLM_MODEL}` (Groq)")
     st.markdown(f"Retrieval: Top-{TOP_K} cosine")
+
+    st.divider()
+
+    # Cost estimate (Session 8, slide 23)
+    st.markdown("**Estimated Cost per Query**")
+    est_input_tokens = TOP_K * CHUNK_SIZE + 200
+    est_output_tokens = 500
+    st.markdown(f"~{est_input_tokens:,} input tokens")
+    st.markdown(f"~{est_output_tokens} output tokens")
+    st.markdown("LLM: Free tier (Groq)")
 
     st.divider()
 
@@ -1026,7 +1066,7 @@ with st.expander("RAG Pipeline Architecture", expanded=True):
 # ══════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════
-tab_qa, tab_eval = st.tabs(["📡 Ask a Question", "📊 Evaluation Dashboard"])
+tab_qa, tab_eval, tab_compare = st.tabs(["📡 Ask a Question", "📊 Evaluation Dashboard", "🔬 Strategy Comparison"])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1067,11 +1107,25 @@ with tab_qa:
                 st.error(f"Error during RAG pipeline: {e}")
                 st.stop()
 
-        # Timing metrics
-        col_t1, col_t2, col_t3 = st.columns(3)
-        col_t1.metric("Retrieval Time", f"{result['retrieval_time_ms']} ms")
-        col_t2.metric("Generation Time", f"{result['generation_time_ms']} ms")
-        col_t3.metric("Total Time", f"{result['total_time_ms']} ms")
+        # Timing metrics — granular breakdown (Session 8, slide 22)
+        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+        col_t1.metric("Embedding", f"{result['embedding_time_ms']} ms")
+        col_t2.metric("Retrieval", f"{result['retrieval_time_ms']} ms")
+        col_t3.metric("Generation", f"{result['generation_time_ms']} ms")
+        col_t4.metric("Total", f"{result['total_time_ms']} ms")
+
+        # Retrieval confidence warning (Session 8, slide 25)
+        if result["sources"]:
+            top_score = result["sources"][0]["score"]
+            if top_score < 0.5:
+                st.markdown("""
+                <div class="warn-card">
+                    <p class="card-title">Low Retrieval Confidence</p>
+                    <p class="card-text">The top relevance score is below 50%. The retrieved chunks
+                    may not adequately address this query. Consider rephrasing your question or
+                    noting that the knowledge base may not cover this topic.</p>
+                </div>
+                """, unsafe_allow_html=True)
 
         # RAG answer
         st.markdown("""
@@ -1164,6 +1218,7 @@ with tab_eval:
                     "question": question[:80] + "...",
                     "top_source_doc": top_source["doc_name"] if top_source else "N/A",
                     "top_score": top_source["score"] if top_source else 0,
+                    "embedding_ms": result["embedding_time_ms"],
                     "retrieval_ms": result["retrieval_time_ms"],
                     "generation_ms": result["generation_time_ms"],
                     "total_ms": result["total_time_ms"],
@@ -1177,6 +1232,7 @@ with tab_eval:
                     "question": question[:80] + "...",
                     "top_source_doc": "ERROR",
                     "top_score": 0,
+                    "embedding_ms": 0,
                     "retrieval_ms": 0,
                     "generation_ms": 0,
                     "total_ms": 0,
@@ -1203,33 +1259,99 @@ with tab_eval:
             "Question": r["question"],
             "Top Source": r["top_source_doc"],
             "Top Score": f"{r['top_score']*100:.1f}%",
-            "Retrieval (ms)": r["retrieval_ms"],
-            "Generation (ms)": r["generation_ms"],
+            "Embed (ms)": r["embedding_ms"],
+            "Retrieve (ms)": r["retrieval_ms"],
+            "Generate (ms)": r["generation_ms"],
             "Sources": r["sources_found"],
             "Citations": "Yes" if r["has_citations"] else "No",
         } for r in results])
 
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # Aggregate metrics
+        # Aggregate metrics + IR metrics (Session 8, slide 26)
         valid = [r for r in results if r["top_source_doc"] != "ERROR"]
         if valid:
             st.markdown("""
             <div class="info-card">
-                <p class="card-title">Aggregate Metrics</p>
+                <p class="card-title">Aggregate Performance Metrics</p>
             </div>
             """, unsafe_allow_html=True)
 
+            avg_embedding = sum(r["embedding_ms"] for r in valid) / len(valid)
             avg_retrieval = sum(r["retrieval_ms"] for r in valid) / len(valid)
             avg_generation = sum(r["generation_ms"] for r in valid) / len(valid)
             avg_top_score = sum(r["top_score"] for r in valid) / len(valid)
             citation_rate = sum(1 for r in valid if r["has_citations"]) / len(valid)
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Avg Retrieval", f"{avg_retrieval:.0f} ms")
-            mc2.metric("Avg Generation", f"{avg_generation:.0f} ms")
-            mc3.metric("Avg Top Relevance", f"{avg_top_score*100:.1f}%")
-            mc4.metric("Citation Rate", f"{citation_rate*100:.0f}%")
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("Avg Embedding", f"{avg_embedding:.0f} ms")
+            mc2.metric("Avg Retrieval", f"{avg_retrieval:.0f} ms")
+            mc3.metric("Avg Generation", f"{avg_generation:.0f} ms")
+            mc4.metric("Avg Top Relevance", f"{avg_top_score*100:.1f}%")
+            mc5.metric("Citation Rate", f"{citation_rate*100:.0f}%")
+
+            # IR Metrics (Session 8, slide 26)
+            st.markdown("""
+            <div class="info-card">
+                <p class="card-title">Information Retrieval Metrics (Session 8)</p>
+                <p class="card-text">Standard IR evaluation metrics: Hit Rate@k measures if at least one
+                relevant chunk appears in top-k; MRR (Mean Reciprocal Rank) averages the inverse rank
+                of the first relevant result.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            relevance_threshold = 0.5
+            hit_count = sum(1 for r in valid if r["top_score"] >= relevance_threshold)
+            hit_rate = hit_count / len(valid)
+
+            # MRR: reciprocal rank of first chunk above threshold
+            mrr_sum = 0.0
+            for r in valid:
+                for rank, src in enumerate(r["all_sources"], 1):
+                    if src["score"] >= relevance_threshold:
+                        mrr_sum += 1.0 / rank
+                        break
+            mrr = mrr_sum / len(valid)
+
+            ir1, ir2, ir3 = st.columns(3)
+            ir1.metric(f"Hit Rate @{TOP_K}", f"{hit_rate*100:.0f}%")
+            ir2.metric("MRR", f"{mrr:.3f}")
+            ir3.metric("Relevance Threshold", f"{relevance_threshold*100:.0f}%")
+
+            # Latency breakdown pie-style (Session 8, slide 22)
+            st.markdown("""
+            <div class="info-card">
+                <p class="card-title">Latency Breakdown (Session 8, Slide 22)</p>
+                <p class="card-text">Where time is spent in a RAG query &mdash; LLM generation typically dominates.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            total_avg = avg_embedding + avg_retrieval + avg_generation
+            if total_avg > 0:
+                pct_embed = avg_embedding / total_avg * 100
+                pct_retrieve = avg_retrieval / total_avg * 100
+                pct_generate = avg_generation / total_avg * 100
+                lat_df = pd.DataFrame({
+                    "Component": ["Embedding", "Retrieval", "LLM Generation"],
+                    "Time (ms)": [round(avg_embedding), round(avg_retrieval), round(avg_generation)],
+                    "Share (%)": [round(pct_embed, 1), round(pct_retrieve, 1), round(pct_generate, 1)],
+                })
+                st.dataframe(lat_df, use_container_width=True, hide_index=True)
+                fig_lat = go.Figure(data=[go.Pie(
+                    labels=lat_df["Component"],
+                    values=lat_df["Time (ms)"],
+                    hole=0.45,
+                    marker=dict(colors=_PLOTLY_PALETTE[:3]),
+                    textinfo="label+percent",
+                    textfont=dict(color=_PLOTLY_TEXT),
+                    hovertemplate="%{label}: %{value} ms (%{percent})<extra></extra>",
+                )])
+                fig_lat.update_layout(_plotly_layout(
+                    title=dict(text="Time Distribution", font=dict(size=14)),
+                    showlegend=False,
+                    height=320,
+                ))
+                st.plotly_chart(fig_lat, use_container_width=True)
 
         # Document retrieval frequency
         st.markdown("""
@@ -1250,7 +1372,21 @@ with tab_eval:
                 sorted(doc_freq.items(), key=lambda x: -x[1]),
                 columns=["Document", "Times Retrieved"]
             )
-            st.bar_chart(freq_df.set_index("Document"))
+            fig_freq = go.Figure(data=[go.Bar(
+                y=freq_df["Document"],
+                x=freq_df["Times Retrieved"],
+                orientation="h",
+                marker=dict(
+                    color=freq_df["Times Retrieved"],
+                    colorscale=[[0, "#1E3A52"], [1, _PLOTLY_CYAN]],
+                ),
+                hovertemplate="%{y}<br>Retrieved %{x} times<extra></extra>",
+            )])
+            fig_freq.update_layout(_plotly_layout(
+                height=max(250, len(freq_df) * 45),
+                yaxis=dict(autorange="reversed", gridcolor="#1E3A52"),
+            ))
+            st.plotly_chart(fig_freq, use_container_width=True)
 
         # Relevance score distribution
         st.markdown("""
@@ -1264,7 +1400,379 @@ with tab_eval:
             "Question": [f"Q{r['question_num']}" for r in valid],
             "Top Relevance Score": [r["top_score"] for r in valid],
         })
-        st.bar_chart(score_df.set_index("Question"))
+        bar_colors = [
+            "#4CAF50" if s >= 0.8 else "#FFC107" if s >= 0.5 else "#F44336"
+            for s in score_df["Top Relevance Score"]
+        ]
+        fig_rel = go.Figure(data=[go.Bar(
+            x=score_df["Question"],
+            y=score_df["Top Relevance Score"],
+            marker=dict(color=bar_colors),
+            text=[f"{s:.1%}" for s in score_df["Top Relevance Score"]],
+            textposition="outside",
+            textfont=dict(color=_PLOTLY_TEXT),
+            hovertemplate="Q%{x}<br>Score: %{y:.3f}<extra></extra>",
+        )])
+        fig_rel.update_layout(_plotly_layout(
+            height=350,
+            yaxis=dict(range=[0, 1.05], title="Relevance Score", gridcolor="#1E3A52"),
+            xaxis=dict(title="Question"),
+        ))
+        # Add threshold line at 0.5
+        fig_rel.add_hline(y=0.5, line_dash="dash", line_color="#FFC107",
+                          annotation_text="50% threshold", annotation_font_color=_PLOTLY_TEXT)
+        st.plotly_chart(fig_rel, use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 3: Strategy Comparison (Session 8, slides 7-8, deliverable #3)
+# ──────────────────────────────────────────────────────────────────────
+with tab_compare:
+    st.markdown("""
+    <div class="info-card">
+        <p class="card-title">Chunking Strategy Comparison (Session 8)</p>
+        <p class="card-text">Compare retrieval performance across three chunking strategies:
+        fixed-size token windows, sentence-based grouping, and semantic similarity breakpoints.
+        This directly addresses the Session 8 deliverable: evaluate hit rate across chunk configurations.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Show strategy stats
+    strategy_stats = get_all_strategy_stats()
+    sc1, sc2, sc3 = st.columns(3)
+    sc1.metric("Fixed-Size", f"{strategy_stats.get('fixed', 0)} chunks",
+               help=f"{CHUNK_SIZE} tokens, {CHUNK_OVERLAP} overlap")
+    sc2.metric("Sentence-Based", f"{strategy_stats.get('sentence', 0)} chunks",
+               help=f"{SENTENCE_CHUNK_TARGET} sentences per chunk")
+    sc3.metric("Semantic", f"{strategy_stats.get('semantic', 0)} chunks",
+               help=f"Cosine threshold: {SEMANTIC_SIMILARITY_THRESHOLD}")
+
+    run_compare = st.button("Run Strategy Comparison", type="primary", key="compare_btn")
+
+    if run_compare:
+        strategies = ["fixed", "sentence", "semantic"]
+        strategy_labels = {
+            "fixed": f"Fixed ({CHUNK_SIZE} tokens)",
+            "sentence": f"Sentence ({SENTENCE_CHUNK_TARGET} sent/chunk)",
+            "semantic": f"Semantic (threshold {SEMANTIC_SIMILARITY_THRESHOLD})",
+        }
+        compare_results = {s: [] for s in strategies}
+
+        progress = st.progress(0, text="Starting comparison...")
+        total_steps = len(SAMPLE_QUESTIONS) * len(strategies)
+        step = 0
+
+        for qi, question in enumerate(SAMPLE_QUESTIONS):
+            for s in strategies:
+                progress.progress(
+                    step / total_steps,
+                    text=f"Q{qi+1}/{len(SAMPLE_QUESTIONS)} — {s} strategy..."
+                )
+                try:
+                    ret = retrieve_with_strategy(question, s, top_k=TOP_K)
+                    chunks = ret["chunks"]
+                    top_score = chunks[0]["score"] if chunks else 0
+                    compare_results[s].append({
+                        "question_num": qi + 1,
+                        "top_score": top_score,
+                        "avg_score": sum(c["score"] for c in chunks) / len(chunks) if chunks else 0,
+                        "search_ms": ret["search_time_ms"],
+                        "hit": 1 if top_score >= 0.5 else 0,
+                    })
+                except Exception as e:
+                    compare_results[s].append({
+                        "question_num": qi + 1,
+                        "top_score": 0,
+                        "avg_score": 0,
+                        "search_ms": 0,
+                        "hit": 0,
+                    })
+                step += 1
+
+            if qi < len(SAMPLE_QUESTIONS) - 1:
+                time.sleep(0.5)
+
+        progress.progress(1.0, text="Comparison complete!")
+
+        # ── Results ──
+
+        # 1. Top Relevance Score per Question per Strategy (bar chart)
+        st.markdown("""
+        <div class="success-card">
+            <p class="card-title">Top Relevance Score by Strategy (per Question)</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        questions = [f"Q{i+1}" for i in range(len(SAMPLE_QUESTIONS))]
+        fig_strat = go.Figure()
+        for idx, s in enumerate(strategies):
+            fig_strat.add_trace(go.Bar(
+                name=strategy_labels[s],
+                x=questions,
+                y=[r["top_score"] for r in compare_results[s]],
+                marker=dict(color=_PLOTLY_PALETTE[idx]),
+                hovertemplate=f"{strategy_labels[s]}<br>Q%{{x}}: %{{y:.3f}}<extra></extra>",
+            ))
+        fig_strat.update_layout(_plotly_layout(
+            barmode="group",
+            height=400,
+            yaxis=dict(range=[0, 1.05], title="Top Relevance Score", gridcolor="#1E3A52"),
+            xaxis=dict(title="Question"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        ))
+        fig_strat.add_hline(y=0.5, line_dash="dash", line_color="#FFC107",
+                            annotation_text="50% threshold", annotation_font_color=_PLOTLY_TEXT)
+        st.plotly_chart(fig_strat, use_container_width=True)
+
+        # 2. Aggregate comparison table
+        st.markdown("""
+        <div class="info-card">
+            <p class="card-title">Aggregate Strategy Metrics</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        agg_rows = []
+        for s in strategies:
+            data = compare_results[s]
+            valid_data = [d for d in data if d["top_score"] > 0]
+            if valid_data:
+                avg_top = sum(d["top_score"] for d in valid_data) / len(valid_data)
+                avg_all = sum(d["avg_score"] for d in valid_data) / len(valid_data)
+                hit_rate = sum(d["hit"] for d in data) / len(data)
+                avg_search = sum(d["search_ms"] for d in valid_data) / len(valid_data)
+                # MRR (all top-1, so MRR = hit_rate for top-score threshold)
+                mrr = hit_rate  # since we check top-1 score
+            else:
+                avg_top = avg_all = hit_rate = avg_search = mrr = 0
+
+            agg_rows.append({
+                "Strategy": strategy_labels[s],
+                "Chunks": strategy_stats.get(s, 0),
+                "Avg Top Score": f"{avg_top*100:.1f}%",
+                "Avg All Scores": f"{avg_all*100:.1f}%",
+                f"Hit Rate @{TOP_K}": f"{hit_rate*100:.0f}%",
+                "MRR": f"{mrr:.3f}",
+                "Avg Search (ms)": f"{avg_search:.0f}",
+            })
+
+        agg_df = pd.DataFrame(agg_rows)
+        st.dataframe(agg_df, use_container_width=True, hide_index=True)
+
+        # 3. Hit Rate comparison bar chart
+        st.markdown("""
+        <div class="info-card">
+            <p class="card-title">Hit Rate Comparison (Session 8, Slide 26)</p>
+            <p class="card-text">Fraction of queries where the top retrieved chunk has relevance &ge; 50%.
+            This is the key IR metric from Session 8 for comparing chunking configurations.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        hr_values = [
+            sum(d["hit"] for d in compare_results[s]) / len(compare_results[s]) * 100
+            for s in strategies
+        ]
+        fig_hr = go.Figure(data=[go.Bar(
+            x=[strategy_labels[s] for s in strategies],
+            y=hr_values,
+            marker=dict(color=_PLOTLY_PALETTE[:3]),
+            text=[f"{v:.0f}%" for v in hr_values],
+            textposition="outside",
+            textfont=dict(color=_PLOTLY_TEXT, size=14),
+            hovertemplate="%{x}<br>Hit Rate: %{y:.1f}%<extra></extra>",
+        )])
+        fig_hr.update_layout(_plotly_layout(
+            height=350,
+            yaxis=dict(range=[0, 110], title="Hit Rate (%)", gridcolor="#1E3A52"),
+        ))
+        st.plotly_chart(fig_hr, use_container_width=True)
+
+        # 4. Search latency comparison
+        st.markdown("""
+        <div class="info-card">
+            <p class="card-title">Search Latency by Strategy</p>
+            <p class="card-text">Average vector search time (excluding embedding) per strategy.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        lat_values = [
+            sum(d["search_ms"] for d in compare_results[s]) / len(compare_results[s])
+            for s in strategies
+        ]
+        fig_latc = go.Figure(data=[go.Bar(
+            x=[strategy_labels[s] for s in strategies],
+            y=lat_values,
+            marker=dict(
+                color=lat_values,
+                colorscale=[[0, _PLOTLY_CYAN], [1, "#F44336"]],
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text="ms", font=dict(color=_PLOTLY_TEXT)),
+                    tickfont=dict(color=_PLOTLY_TEXT),
+                ),
+            ),
+            text=[f"{v:.0f} ms" for v in lat_values],
+            textposition="outside",
+            textfont=dict(color=_PLOTLY_TEXT, size=13),
+            hovertemplate="%{x}<br>Avg: %{y:.1f} ms<extra></extra>",
+        )])
+        fig_latc.update_layout(_plotly_layout(
+            height=350,
+            yaxis=dict(title="Avg Search Time (ms)", gridcolor="#1E3A52"),
+        ))
+        st.plotly_chart(fig_latc, use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Chunk-Size Comparison (Session 8, slides 27-28)
+    # "Vary chunk sizes (200, 500, 1000) and measure hit rate @5"
+    # ──────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("""
+    <div class="info-card">
+        <p class="card-title">Chunk-Size Comparison (Session 8, Slides 27-28)</p>
+        <p class="card-text">Vary fixed-size token windows (200, 512, 1000 tokens) and compare
+        hit rate, relevance scores, and search latency. This is the explicit Session 8 deliverable:
+        &ldquo;bar chart comparing configurations.&rdquo;</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    cs_stats = get_chunk_size_stats()
+    available_sizes = [sz for sz in CHUNK_SIZE_VARIANTS if cs_stats.get(sz, 0) > 0]
+
+    if len(available_sizes) < 2:
+        st.warning(
+            "Chunk-size comparison requires at least 2 ingested sizes. "
+            "Run ingestion for the missing sizes:\n\n"
+            "```\npython ingest.py --chunk-size 200\n"
+            "python ingest.py --chunk-size 1000\n```"
+        )
+    else:
+        cs_cols = st.columns(len(available_sizes))
+        for i, sz in enumerate(available_sizes):
+            cs_cols[i].metric(f"{sz} tokens", f"{cs_stats[sz]} chunks")
+
+        run_cs = st.button("Run Chunk-Size Comparison", type="primary", key="cs_compare_btn")
+
+        if run_cs:
+            cs_results = {sz: [] for sz in available_sizes}
+            progress_cs = st.progress(0, text="Starting chunk-size comparison...")
+            total_steps = len(SAMPLE_QUESTIONS) * len(available_sizes)
+            step = 0
+
+            for qi, question in enumerate(SAMPLE_QUESTIONS):
+                for sz in available_sizes:
+                    progress_cs.progress(
+                        step / total_steps,
+                        text=f"Q{qi+1}/{len(SAMPLE_QUESTIONS)} — {sz} tokens..."
+                    )
+                    try:
+                        ret = retrieve_with_strategy(question, "fixed", top_k=TOP_K,
+                                                     chunk_size=sz)
+                        chunks = ret["chunks"]
+                        top_score = chunks[0]["score"] if chunks else 0
+                        cs_results[sz].append({
+                            "question_num": qi + 1,
+                            "top_score": top_score,
+                            "avg_score": (sum(c["score"] for c in chunks) / len(chunks)
+                                          if chunks else 0),
+                            "search_ms": ret["search_time_ms"],
+                            "hit": 1 if top_score >= 0.5 else 0,
+                        })
+                    except Exception:
+                        cs_results[sz].append({
+                            "question_num": qi + 1,
+                            "top_score": 0, "avg_score": 0,
+                            "search_ms": 0, "hit": 0,
+                        })
+                    step += 1
+
+                if qi < len(SAMPLE_QUESTIONS) - 1:
+                    time.sleep(0.3)
+
+            progress_cs.progress(1.0, text="Chunk-size comparison complete!")
+
+            # 1. Grouped bar: top score per question per chunk size
+            st.markdown("""
+            <div class="success-card">
+                <p class="card-title">Top Relevance Score by Chunk Size (per Question)</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            size_labels = {sz: f"{sz} tokens" for sz in available_sizes}
+            questions_cs = [f"Q{i+1}" for i in range(len(SAMPLE_QUESTIONS))]
+            fig_cs = go.Figure()
+            for idx, sz in enumerate(available_sizes):
+                fig_cs.add_trace(go.Bar(
+                    name=size_labels[sz],
+                    x=questions_cs,
+                    y=[r["top_score"] for r in cs_results[sz]],
+                    marker=dict(color=_PLOTLY_PALETTE[idx % len(_PLOTLY_PALETTE)]),
+                    hovertemplate=f"{sz} tokens<br>Q%{{x}}: %{{y:.3f}}<extra></extra>",
+                ))
+            fig_cs.update_layout(_plotly_layout(
+                barmode="group", height=400,
+                yaxis=dict(range=[0, 1.05], title="Top Relevance Score", gridcolor="#1E3A52"),
+                xaxis=dict(title="Question"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            ))
+            fig_cs.add_hline(y=0.5, line_dash="dash", line_color="#FFC107",
+                             annotation_text="50% threshold", annotation_font_color=_PLOTLY_TEXT)
+            st.plotly_chart(fig_cs, use_container_width=True)
+
+            # 2. Hit Rate comparison bar
+            st.markdown("""
+            <div class="info-card">
+                <p class="card-title">Hit Rate @{top_k} by Chunk Size (Session 8, Slide 28)</p>
+                <p class="card-text">The key deliverable: compare hit rate across chunk sizes
+                (200, 512, 1000 tokens).</p>
+            </div>
+            """.replace("{top_k}", str(TOP_K)), unsafe_allow_html=True)
+
+            hr_cs_values = [
+                sum(d["hit"] for d in cs_results[sz]) / len(cs_results[sz]) * 100
+                for sz in available_sizes
+            ]
+            fig_hr_cs = go.Figure(data=[go.Bar(
+                x=[size_labels[sz] for sz in available_sizes],
+                y=hr_cs_values,
+                marker=dict(color=_PLOTLY_PALETTE[:len(available_sizes)]),
+                text=[f"{v:.0f}%" for v in hr_cs_values],
+                textposition="outside",
+                textfont=dict(color=_PLOTLY_TEXT, size=14),
+                hovertemplate="%{x}<br>Hit Rate: %{y:.1f}%<extra></extra>",
+            )])
+            fig_hr_cs.update_layout(_plotly_layout(
+                height=350,
+                yaxis=dict(range=[0, 110], title="Hit Rate (%)", gridcolor="#1E3A52"),
+            ))
+            st.plotly_chart(fig_hr_cs, use_container_width=True)
+
+            # 3. Aggregate table
+            st.markdown("""
+            <div class="info-card">
+                <p class="card-title">Aggregate Chunk-Size Metrics</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            cs_agg = []
+            for sz in available_sizes:
+                data = cs_results[sz]
+                valid = [d for d in data if d["top_score"] > 0]
+                if valid:
+                    avg_top = sum(d["top_score"] for d in valid) / len(valid)
+                    avg_all = sum(d["avg_score"] for d in valid) / len(valid)
+                    hit_rate = sum(d["hit"] for d in data) / len(data)
+                    avg_ms = sum(d["search_ms"] for d in valid) / len(valid)
+                else:
+                    avg_top = avg_all = hit_rate = avg_ms = 0
+                cs_agg.append({
+                    "Chunk Size": size_labels[sz],
+                    "Total Chunks": cs_stats[sz],
+                    "Avg Top Score": f"{avg_top*100:.1f}%",
+                    "Avg All Scores": f"{avg_all*100:.1f}%",
+                    f"Hit Rate @{TOP_K}": f"{hit_rate*100:.0f}%",
+                    "Avg Search (ms)": f"{avg_ms:.0f}",
+                })
+            st.dataframe(pd.DataFrame(cs_agg), use_container_width=True, hide_index=True)
 
 
 # ── Footer ──

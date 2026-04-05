@@ -54,6 +54,53 @@ def _get_llm_client() -> OpenAI:
     return _llm_client
 
 
+def retrieve_with_strategy(query: str, strategy: str, top_k: int = TOP_K,
+                           chunk_size: int = None) -> list[dict]:
+    """Retrieve chunks from a specific chunking strategy's collection.
+
+    Args:
+        chunk_size: For fixed strategy, override chunk size to query a
+            variant collection (200, 512, 1000 tokens).
+
+    Returns a dict with keys: chunks, embedding_time_ms, search_time_ms
+    """
+    model = _get_embedding_model()
+    client = _get_chroma_client()
+
+    embed_start = time.time()
+    query_embedding = model.encode(query).tolist()
+    embed_time = (time.time() - embed_start) * 1000
+
+    collection = client.get_collection(get_collection_name(strategy, chunk_size=chunk_size))
+
+    search_start = time.time()
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+    search_time = (time.time() - search_start) * 1000
+
+    chunks = []
+    for i in range(len(results["ids"][0])):
+        distance = results["distances"][0][i]
+        score = 1.0 - distance
+        meta = results["metadatas"][0][i]
+        chunks.append({
+            "text": results["documents"][0][i],
+            "doc_name": meta["doc_name"],
+            "page_start": meta["page_start"],
+            "page_end": meta["page_end"],
+            "score": round(score, 4),
+        })
+
+    return {
+        "chunks": chunks,
+        "embedding_time_ms": round(embed_time),
+        "search_time_ms": round(search_time),
+    }
+
+
 def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
     """Retrieve the top-k most relevant chunks for a query.
 
@@ -144,18 +191,21 @@ def generate_without_rag(query: str) -> str:
     return response.choices[0].message.content
 
 
-def query_pipeline(query: str, top_k: int = TOP_K) -> dict:
-    """Full RAG pipeline: retrieve -> generate, with timing.
+def query_pipeline(query: str, top_k: int = TOP_K, strategy: str = None) -> dict:
+    """Full RAG pipeline: embed -> retrieve -> generate, with granular timing.
 
-    Returns:
-        dict with keys: answer, sources, retrieval_time_ms, generation_time_ms, total_time_ms
+    Returns dict with keys:
+        answer, sources, embedding_time_ms, retrieval_time_ms,
+        generation_time_ms, total_time_ms
     """
     total_start = time.time()
+    s = strategy or CHUNKING_STRATEGY
 
-    # Retrieve
-    retrieval_start = time.time()
-    sources = retrieve(query, top_k=top_k)
-    retrieval_time = (time.time() - retrieval_start) * 1000
+    # Embed + Retrieve (granular)
+    ret = retrieve_with_strategy(query, s, top_k=top_k)
+    sources = ret["chunks"]
+    embedding_time = ret["embedding_time_ms"]
+    retrieval_time = ret["search_time_ms"]
 
     # Generate
     generation_start = time.time()
@@ -167,6 +217,7 @@ def query_pipeline(query: str, top_k: int = TOP_K) -> dict:
     return {
         "answer": answer,
         "sources": sources,
+        "embedding_time_ms": round(embedding_time),
         "retrieval_time_ms": round(retrieval_time),
         "generation_time_ms": round(generation_time),
         "total_time_ms": round(total_time),
@@ -192,3 +243,33 @@ def get_db_stats() -> dict:
         "doc_chunk_counts": doc_chunk_counts,
         "strategy": CHUNKING_STRATEGY,
     }
+
+
+def get_all_strategy_stats() -> dict:
+    """Get chunk counts for all available chunking strategies."""
+    client = _get_chroma_client()
+    stats = {}
+    for s in ["fixed", "sentence", "semantic"]:
+        try:
+            col = client.get_collection(get_collection_name(s))
+            stats[s] = col.count()
+        except Exception:
+            stats[s] = 0
+    return stats
+
+
+def get_chunk_size_stats() -> dict:
+    """Get chunk counts for fixed-strategy chunk-size variants (200, 512, 1000).
+
+    Returns dict like {200: 1200, 512: 676, 1000: 350}.
+    """
+    from config import CHUNK_SIZE_VARIANTS
+    client = _get_chroma_client()
+    stats = {}
+    for sz in CHUNK_SIZE_VARIANTS:
+        try:
+            col = client.get_collection(get_collection_name("fixed", chunk_size=sz))
+            stats[sz] = col.count()
+        except Exception:
+            stats[sz] = 0
+    return stats

@@ -30,10 +30,20 @@ SENTENCE_CHUNK_TARGET = 5  # sentences per chunk (sentence strategy)
 SEMANTIC_SIMILARITY_THRESHOLD = 0.5  # cosine similarity breakpoint (semantic strategy)
 
 
-def get_collection_name(strategy: str = None) -> str:
-    """Return the ChromaDB collection name for a given chunking strategy."""
+# Chunk-size variants for Session 8 slide 27-28 comparison
+CHUNK_SIZE_VARIANTS = [200, 512, 1000]
+
+
+def get_collection_name(strategy: str = None, chunk_size: int = None) -> str:
+    """Return the ChromaDB collection name for a given chunking strategy.
+
+    For fixed strategy with non-default chunk sizes (200, 1000), appends
+    the size to create separate collections for the slide 27-28 comparison.
+    """
     s = strategy or CHUNKING_STRATEGY
     if s == "fixed":
+        if chunk_size is not None and chunk_size != CHUNK_SIZE:
+            return f"{COLLECTION_NAME}_fixed_{chunk_size}"
         return COLLECTION_NAME  # backward compatible with existing DB
     return f"{COLLECTION_NAME}_{s}"
 
